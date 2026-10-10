@@ -344,61 +344,89 @@ it.effect("reveals a file in File Explorer through PowerShell on Windows", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// Real-chain smoke check for the Explorer selection contract: runs the exact
-// PowerShell source the reveal launch encodes, against a stub that records
-// the raw argument tail it receives, and asserts a spaced path arrives as the
-// single `/select,"<path>"` switch. Mock argv assertions cannot prove this —
-// only Windows' own PowerShell -> CreateProcess quoting chain can, so the
-// test runs only where that chain exists.
-// oxlint-disable-next-line t3code/no-global-process-runtime -- the skip decision needs the real host platform, outside any Effect runtime.
-it.skipIf(process.platform !== "win32")(
-  "delivers the raw /select switch for spaced paths through real PowerShell",
-  { timeout: 60_000 },
-  async () => {
-    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-reveal-smoke-"));
-    try {
-      const recorderPath = NodePath.join(tempDir, "recorder.cmd");
-      const outputPath = NodePath.join(tempDir, "argv.txt");
-      NodeFS.writeFileSync(recorderPath, `@echo off\r\n>"${outputPath}" echo(%*\r\n`);
+// Replay the launcher's actual command and spawn options through Windows
+// PowerShell. A detached helper with ignored stdio may exit 0 without running
+// its command, which a source-only test with default stdio cannot detect.
+it.effect.skipIf(!windowsHost)(
+  "executes the Windows reveal helper with ignored stdio and selects the requested path",
+  () =>
+    Effect.gen(function* () {
+      const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-reveal-smoke-"));
+      try {
+        const recorderPath = NodePath.join(tempDir, "recorder.cmd");
+        const outputPath = NodePath.join(tempDir, "argv.txt");
+        NodeFS.writeFileSync(recorderPath, `@echo off\r\n>"${outputPath}" echo(%*\r\n`);
 
-      const target = "C:/workspace with spaces/media/author's clip.mp4";
-      const explorerTarget = target.replaceAll("/", "\\");
-      const source = ExternalLauncher.buildFileExplorerRevealPowerShellSource(
-        recorderPath,
-        explorerTarget,
-      );
-      const powerShellPath = `${process.env.SYSTEMROOT ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
-      NodeChildProcess.execFileSync(
-        powerShellPath,
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-EncodedCommand",
-          Buffer.from(source, "utf16le").toString("base64"),
-        ],
-        { timeout: 30_000 },
-      );
-
-      // Start-Process returns before the recorder runs; wait for its output.
-      // The waits run outside the Effect runtime on purpose: the test
-      // exercises the real Windows process chain in real time.
-      // @effect-diagnostics-next-line globalTimers:off
-      const sleep = (millis: number) => new Promise((resolve) => setTimeout(resolve, millis));
-      // @effect-diagnostics-next-line globalDate:off
-      const deadline = Date.now() + 20_000;
-      // @effect-diagnostics-next-line globalDate:off
-      while (!NodeFS.existsSync(outputPath) && Date.now() < deadline) {
-        await sleep(100);
+        const target = "C:/workspace with spaces/media/author's clip.mp4";
+        const explorerTarget = target.replaceAll("/", "\\");
+        const env = yield* HostProcess.Environment;
+        let spawned: ChildProcess.StandardCommand | undefined;
+        let didUnref = false;
+        yield* Effect.gen(function* () {
+          const launcher = yield* ExternalLauncher.ExternalLauncher;
+          yield* launcher.launchEditor({ editor: "file-manager", cwd: target, reveal: true });
+        }).pipe(
+          Effect.provide(
+            layerTest({
+              platform: "win32",
+              env: Object.fromEntries(
+                Object.entries(env).flatMap(([key, value]) =>
+                  value === undefined ? [] : [[key, value]],
+                ),
+              ),
+              onSpawn: (command) => {
+                spawned = command;
+              },
+              onUnref: () => {
+                didUnref = true;
+              },
+            }),
+          ),
+        );
+        assert.ok(spawned);
+        assert.equal(didUnref, true);
+        assert.equal(spawned.options.stdin, "ignore");
+        assert.equal(spawned.options.stdout, "ignore");
+        assert.equal(spawned.options.stderr, "ignore");
+        const encodedCommand = spawned.args[spawned.args.length - 1] ?? "";
+        const source =
+          Buffer.from(encodedCommand, "base64")
+            .toString("utf16le")
+            .replace("'explorer.exe'", `'${recorderPath.replaceAll("'", "''")}'`) + " -Wait";
+        // Only the recorder waits. Production continues to launch and unref the
+        // helper immediately; waiting here makes the file assertion deterministic.
+        const command = spawned;
+        const exitCode = yield* Effect.callback<number, Error>((resume) => {
+          const child = NodeChildProcess.spawn(
+            command.command,
+            [...command.args.slice(0, -1), Buffer.from(source, "utf16le").toString("base64")],
+            {
+              detached: command.options.detached,
+              shell: command.options.shell,
+              stdio: "ignore",
+              windowsHide: command.options.windowsHide ?? !command.options.detached,
+            },
+          );
+          child.once("error", (error) => resume(Effect.fail(error)));
+          child.once("exit", (code, signal) =>
+            resume(
+              code === null
+                ? Effect.fail(new Error(`Reveal helper exited with signal ${signal}`))
+                : Effect.succeed(code),
+            ),
+          );
+          return Effect.sync(() => {
+            if (child.exitCode === null) child.kill();
+          });
+        });
+        assert.equal(exitCode, 0);
+        const recorded = NodeFS.readFileSync(outputPath, "utf8").trim();
+        assert.equal(recorded, `/select,"${explorerTarget}"`);
+      } finally {
+        NodeFS.rmSync(tempDir, { recursive: true, force: true });
       }
-      await sleep(200);
-      const recorded = NodeFS.readFileSync(outputPath, "utf8").trim();
-      assert.equal(recorded, `/select,"${explorerTarget}"`);
-    } finally {
-      NodeFS.rmSync(tempDir, { recursive: true, force: true });
-    }
-  },
+    }).pipe(Effect.scoped),
+  { timeout: 60_000 },
 );
 
 it.effect("does not advertise reveal on Windows when PowerShell is missing", () =>

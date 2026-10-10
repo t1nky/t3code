@@ -62,6 +62,7 @@ interface EditorLaunch {
   readonly target: string;
   readonly command: string;
   readonly args: ReadonlyArray<string>;
+  readonly detached?: boolean;
 }
 
 interface ProcessLaunch {
@@ -636,11 +637,16 @@ const resolveFileManagerRevealLaunch = Effect.fn("resolveFileManagerRevealLaunch
   }
 
   if (platform === "win32") {
-    return fileExplorerRevealLaunch(
-      target,
-      normalizeWindowsFileManagerPath(target),
-      resolvePowerShellPath(env),
-    );
+    return {
+      ...fileExplorerRevealLaunch(
+        target,
+        normalizeWindowsFileManagerPath(target),
+        resolvePowerShellPath(env),
+      ),
+      // Detached Windows PowerShell can exit 0 without running the command
+      // when stdio is ignored. The launcher still unreferences the helper.
+      detached: false,
+    };
   }
 
   if (
@@ -744,7 +750,7 @@ const launchEditorProcess = Effect.fn("externalLauncher.launchEditorProcess")(fu
       command: spawnCommand.command,
       args: spawnCommand.args,
       options: {
-        detached: true,
+        detached: launch.detached ?? true,
         shell: spawnCommand.shell,
         stdin: "ignore",
         stdout: "ignore",
